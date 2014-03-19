@@ -2,54 +2,59 @@ package main
 
 import (
 	"encoding/binary"
-	"github.com/oxtoacart/ftcp"
+	"github.com/oxtoacart/framed"
 	"io"
 	"log"
+	"net"
 	"runtime"
 )
 
+type Addr uint64
 type Op uint16
 
 const (
-	OP_SUBSCRIBE = Op(1)
-	OP_APPROVE   = Op(2)
-	OP_SEND      = Op(3)
-	OP_PUBLISH   = Op(4)
-	WADDELL_ADDR = "127.0.0.1:10080"
+	OP_SUBSCRIBE         = Op(1)
+	OP_APPROVE           = Op(2)
+	OP_SEND              = Op(3)
+	OP_PUBLISH           = Op(4)
+	WADDELL_ADDR         = "127.0.0.1:10080"
+	FRAMED_HEADER_LENGTH = 18
 )
+
+var endianness = binary.LittleEndian
 
 // Client represents a client of waddell's
 type Client struct {
-	addr                  string
-	conn                  *ftcp.Conn
-	subscriptionRequests  map[string]bool // requests to subscribe to Client's messages
-	subscriptionApprovals map[string]bool // permission to subscribe to Client's messages
-	subscriptions         map[string]bool
+	addr                  Addr
+	conn                  *framed.Framed
+	subscriptionRequests  map[Addr]bool // requests to subscribe to Client's messages
+	subscriptionApprovals map[Addr]bool // permission to subscribe to Client's messages
+	subscriptions         map[Addr]bool
 	msgFrom               chan *Message
 	msgTo                 chan *Message
 }
 
 type Message struct {
-	sender    string
-	recipient string
-	op        Op
-	data      []byte
+	from  Addr
+	to    Addr
+	op    Op
+	frame *framed.Frame
 }
 
 type MessageWithConn struct {
 	msg  *Message
-	conn *ftcp.Conn
+	conn *framed.Framed
 }
 
 var (
-	clients     = make(map[string]*Client)
+	clients     = make(map[Addr]*Client)
 	messagesIn  = make(chan *MessageWithConn, 100000)
 	messagesOut = make(chan *Message, 100000)
 )
 
 func main() {
 	runtime.GOMAXPROCS(2)
-	listener, err := ftcp.Listen(WADDELL_ADDR)
+	listener, err := net.Listen("tcp", WADDELL_ADDR)
 	if err != nil {
 		log.Fatalf("Unable to listen: %s", err)
 	}
@@ -65,17 +70,15 @@ func main() {
 			log.Printf("Unable to accept: %s", err)
 		} else {
 			go func() {
-				reader := conn.Reader()
-				defer reader.Close()
-				for {
-					if msg, err := reader.Read(); err == nil {
-						messagesIn <- &MessageWithConn{newMessage(msg), conn}
+				framed := framed.NewFramed(conn)
+				defer framed.Close()
+				if initialFrame, err := framed.ReadInitial(); err != nil {
+					log.Printf("Unable to start reading: %s", err)
+				} else {
+					if msg, err := newMessage(initialFrame); err != nil {
+						log.Printf("Unable to parse initial message: %s", err)
 					} else {
-						if err == io.EOF {
-							return
-						} else {
-							log.Printf("Unable to read message: %s", err)
-						}
+						messagesIn <- &MessageWithConn{msg: msg, conn: framed}
 					}
 				}
 			}()
@@ -87,39 +90,39 @@ func dispatch() {
 	for {
 		select {
 		case in := <-messagesIn:
-			sender := clients[in.msg.sender]
-			if sender == nil {
-				sender = &Client{
-					addr:                  in.msg.sender,
-					subscriptionRequests:  make(map[string]bool),
-					subscriptionApprovals: make(map[string]bool),
-					subscriptions:         make(map[string]bool),
+			from := clients[in.msg.from]
+			if from == nil {
+				from = &Client{
+					addr:                  in.msg.from,
+					subscriptionRequests:  make(map[Addr]bool),
+					subscriptionApprovals: make(map[Addr]bool),
+					subscriptions:         make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 100),
 					msgTo:                 make(chan *Message, 100),
 				}
-				go sender.dispatch()
-				clients[in.msg.sender] = sender
+				go from.dispatch()
+				clients[in.msg.from] = from
 			}
-			sender.conn = in.conn
-			sender.msgFrom <- in.msg
+			from.conn = in.conn
+			from.msgFrom <- in.msg
 		case out := <-messagesOut:
-			recipient := clients[out.recipient]
-			if recipient == nil {
-				recipient = &Client{
-					addr:                  out.recipient,
-					subscriptionRequests:  make(map[string]bool),
-					subscriptionApprovals: make(map[string]bool),
-					subscriptions:         make(map[string]bool),
+			to := clients[out.to]
+			if to == nil {
+				to = &Client{
+					addr:                  out.to,
+					subscriptionRequests:  make(map[Addr]bool),
+					subscriptionApprovals: make(map[Addr]bool),
+					subscriptions:         make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 100),
 					msgTo:                 make(chan *Message, 100),
 				}
-				go recipient.dispatch()
-				clients[out.recipient] = recipient
+				go to.dispatch()
+				clients[out.to] = to
 			}
-			if recipient.conn != nil {
-				recipient.msgTo <- out
+			if to.conn != nil {
+				to.msgTo <- out
 			} else {
-				log.Printf("Tried to send to disconnected recipient: %s", recipient.addr)
+				log.Printf("Tried to send to disconnected recipient: %s", to.addr)
 			}
 		}
 	}
@@ -131,114 +134,89 @@ func (client *Client) dispatch() {
 		case out := <-client.msgFrom:
 			switch out.op {
 			case OP_APPROVE:
-				client.subscriptionApprovals[out.recipient] = true
-				if client.subscriptionRequests[out.recipient] {
-					client.subscriptions[out.recipient] = true
+				client.subscriptionApprovals[out.to] = true
+				if client.subscriptionRequests[out.to] {
+					client.subscriptions[out.to] = true
 				}
 			case OP_SUBSCRIBE:
 				messagesOut <- out
 			case OP_SEND:
 				messagesOut <- out
 			case OP_PUBLISH:
-				for recipient, _ := range client.subscriptions {
-					messagesOut <- out.to(recipient)
-				}
+				// TODO: handle publishing
+				// for to, _ := range client.subscriptions {
+				// 	messagesOut <- out.withTo(to)
+				// }
 			}
 		case in := <-client.msgTo:
 			switch in.op {
 			case OP_APPROVE:
 				log.Printf("Got request to approve subscription from a different user - this shouldn't happen")
 			case OP_SUBSCRIBE:
-				client.subscriptionRequests[in.sender] = true
-				if client.subscriptionApprovals[in.sender] {
+				client.subscriptionRequests[in.from] = true
+				if client.subscriptionApprovals[in.from] {
 					// Complete subscription
-					client.subscriptions[in.sender] = true
+					client.subscriptions[in.from] = true
 				}
 			case OP_SEND:
-				if client.conn != nil { // TODO: make sure sender is actually approved
-					if err := client.conn.Write(encodeMessage(in)); err != nil {
+				if client.conn != nil { // TODO: make sure from is actually approved
+					if err := in.streamTo(client.conn); err != nil {
 						if err == io.EOF {
 							client.conn = nil
 						} else {
-							log.Printf("Unable to send message from %s to %s: %s", in.sender, in.recipient, err)
+							log.Printf("Unable to send message from %s to %s: %s", in.from, in.to, err)
 						}
 					}
 				} else if client.conn == nil {
 					log.Printf("Client %s has no connection", client.addr)
 				} else {
-					log.Printf("%s is not approved to send to %s", in.sender, in.recipient)
+					log.Printf("%s is not approved to send to %s", in.from, in.to)
 				}
 			}
 		}
 	}
 }
 
-func newMessage(ftcpMsg *ftcp.Message) (msg *Message) {
-	// Read sender and recipient from message
-	// The sender and recipient are variable length, with the first pair
-	// of 16 bit integers indicating their relative lengths
-	senderLength := binary.BigEndian.Uint16(ftcpMsg.Data[0:2])
-	recipientLength := binary.BigEndian.Uint16(ftcpMsg.Data[2:4])
+func newMessage(frame *framed.Frame) (msg *Message, err error) {
+	// TODO: use buffer pool for this
+	msg = &Message{frame: frame}
 
-	senderStart := 4
-	senderEnd := senderStart + int(senderLength)
-	recipientStart := senderEnd
-	recipientEnd := recipientStart + int(recipientLength)
-	opStart := recipientEnd
-	opEnd := opStart + 2
-	dataStart := opEnd
-
-	sender := string(ftcpMsg.Data[senderStart:senderEnd])
-	recipient := string(ftcpMsg.Data[recipientStart:recipientEnd])
-	op := Op(binary.BigEndian.Uint16(ftcpMsg.Data[opStart:opEnd]))
-
-	msg = &Message{
-		sender:    sender,
-		recipient: recipient,
-		op:        op,
-		data:      ftcpMsg.Data[dataStart:],
+	// Read from, to and op from frame header
+	header := frame.Header()
+	if err = binary.Read(header, endianness, &msg.from); err != nil {
+		return
 	}
+	if err = binary.Read(header, endianness, &msg.to); err != nil {
+		return
+	}
+	err = binary.Read(header, endianness, &msg.op)
 
 	return
 }
 
-func encodeMessage(msg *Message) *ftcp.Message {
-	senderLength := len(msg.sender)
-	recipientLength := len(msg.recipient)
-	dataLength := len(msg.data)
+func (msg *Message) streamTo(out *framed.Framed) error {
+	out.WriteHeader(FRAMED_HEADER_LENGTH, msg.frame.BodyLength())
 
-	senderStart := 4
-	senderEnd := senderStart + senderLength
-	recipientStart := senderEnd
-	recipientEnd := recipientStart + recipientLength
-	opStart := recipientEnd
-	opEnd := opStart + 2
-	dataStart := opEnd
-
-	bytes := make([]byte, 6+senderLength+recipientLength+dataLength)
-	binary.BigEndian.PutUint16(bytes[0:2], uint16(senderLength))
-	binary.BigEndian.PutUint16(bytes[2:4], uint16(recipientLength))
-	binary.BigEndian.PutUint16(bytes[opStart:opEnd], uint16(msg.op))
-	senderBytes := []byte(msg.sender)
-	recipientBytes := []byte(msg.recipient)
-	for i := 0; i < senderLength; i++ {
-		bytes[senderStart+i] = senderBytes[i]
+	// Write from, to and op to frame
+	if err := binary.Write(out, endianness, &msg.from); err != nil {
+		return err
 	}
-	for i := 0; i < recipientLength; i++ {
-		bytes[recipientStart+i] = recipientBytes[i]
+	if err := binary.Write(out, endianness, &msg.to); err != nil {
+		return err
 	}
-	for i := 0; i < dataLength; i++ {
-		bytes[dataStart+i] = msg.data[i]
+	if err := binary.Write(out, endianness, &msg.op); err != nil {
+		return err
 	}
 
-	return &ftcp.Message{Data: bytes}
+	// Write body
+	_, err := io.Copy(out, msg.frame.Body())
+	return err
 }
 
-func (msg *Message) to(recipient string) *Message {
+func (msg *Message) withTo(to Addr) *Message {
 	return &Message{
-		sender:    msg.sender,
-		recipient: recipient,
-		op:        OP_SEND,
-		data:      msg.data,
+		from: msg.from,
+		to:   to,
+		op:   OP_SEND,
 	}
 }
