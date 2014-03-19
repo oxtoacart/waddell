@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
-	"github.com/oxtoacart/ftcp"
+	"github.com/oxtoacart/framed"
+	"io"
 	"log"
+	"net"
 	"runtime"
 	"sync"
 	"testing"
@@ -11,12 +13,12 @@ import (
 )
 
 const (
-	NUM_CLIENTS         = 2000
+	NUM_CLIENTS         = 20
 	PEERS_PER_CLIENT    = 5
 	NUM_BROADCASTS      = 250
 	BROADCAST_SPACING   = 8 * time.Millisecond
-	NUM_DIRECT_MESSAGES = 250
-	DIRECT_SPACING      = 8 * time.Millisecond
+	NUM_DIRECT_MESSAGES = 2500
+	DIRECT_SPACING      = 20 * time.Microsecond
 	STARTUP_SPACING     = 20 * time.Millisecond
 )
 
@@ -62,14 +64,14 @@ func TestClient(t *testing.T) {
 }
 
 func runTest(t *testing.T, seq int) {
-	addr := fmt.Sprintf("%d@waddell.waddell", seq)
-	peers := make([]string, PEERS_PER_CLIENT)
+	addr := Addr(seq)
+	peers := make([]Addr, PEERS_PER_CLIENT)
 	for i := 0; i < PEERS_PER_CLIENT; i++ {
 		peer := seq - i
 		if peer < 0 {
 			peer += NUM_CLIENTS
 		}
-		peers[i] = fmt.Sprintf("%d@waddell.waddell", peer)
+		peers[i] = Addr(peer)
 	}
 
 	conn := dialWaddell(t)
@@ -77,11 +79,11 @@ func runTest(t *testing.T, seq int) {
 
 	for _, peer := range peers {
 		msg := &Message{
-			sender:    addr,
-			recipient: peer,
-			op:        OP_SUBSCRIBE,
+			from: addr,
+			to:   peer,
+			op:   OP_SUBSCRIBE,
 		}
-		if err := conn.Write(encodeMessage(msg)); err != nil {
+		if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
 			t.Errorf("Unable to subscribe: %s", err)
 		}
 	}
@@ -89,11 +91,11 @@ func runTest(t *testing.T, seq int) {
 
 	for _, peer := range peers {
 		msg := &Message{
-			sender:    addr,
-			recipient: peer,
-			op:        OP_APPROVE,
+			from: addr,
+			to:   peer,
+			op:   OP_APPROVE,
 		}
-		if err := conn.Write(encodeMessage(msg)); err != nil {
+		if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
 			t.Errorf("Unable to approve subscription: %s", err)
 		}
 	}
@@ -104,49 +106,64 @@ func runTest(t *testing.T, seq int) {
 
 	time.Sleep(2 * time.Second)
 
-	data := []byte("Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello str")
+	body := []byte("Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello str")
+	bodyLength := uint16(len(body))
 	msg := &Message{
-		sender:    addr,
-		recipient: "",
-		op:        OP_PUBLISH,
-		data:      data,
+		from: addr,
+		to:   Addr(0),
+		op:   OP_PUBLISH,
 	}
 
-	finishedBroadcasting := make(chan bool)
+	//finishedBroadcasting := make(chan bool)
 	finishedSending := make(chan bool)
 
 	go func() {
-		reader := conn.Reader()
+		frame, err := conn.ReadInitial()
+		if err != nil {
+			t.Errorf("Unable to read initial frame: %s", err)
+			return
+		}
 		for {
-			if _, err := reader.Read(); err != nil {
+			// Discard the frame
+			frame.Discard()
+			msgReceived <- 1
+			frame, err = frame.Next()
+			if err != nil {
+				if err != io.EOF {
+					t.Errorf("Unable to read next frame: %s", err)
+				}
 				return
-			} else {
-				msgReceived <- 1
 			}
 		}
 	}()
 
-	go func() {
-		for i := 0; i < NUM_BROADCASTS; i++ {
-			if err := conn.Write(encodeMessage(msg)); err != nil {
-				t.Errorf("Unable to publish message: %s", err)
-			}
-			time.Sleep(BROADCAST_SPACING)
-		}
-		finishedBroadcasting <- true
-	}()
+	// go func() {
+	// 	for i := 0; i < NUM_BROADCASTS; i++ {
+	// 		if err := conn.Write(encodeMessage(msg)); err != nil {
+	// 			t.Errorf("Unable to publish message: %s", err)
+	// 		}
+	// 		time.Sleep(BROADCAST_SPACING)
+	// 	}
+	// 	finishedBroadcasting <- true
+	// }()
 
 	go func() {
 		for i := 0; i < NUM_DIRECT_MESSAGES; i++ {
-			if err := conn.Write(encodeMessage(msg.to(peers[i%PEERS_PER_CLIENT]))); err != nil {
+			msgTo := msg.withTo(peers[i%PEERS_PER_CLIENT])
+			if err := msgTo.writeHeaderTo(conn, bodyLength); err != nil {
 				t.Errorf("Unable to send message: %s", err)
+				break
+			}
+			if _, err := conn.Write(body); err != nil {
+				t.Errorf("Unable to write message body: %s", err)
+				break
 			}
 			time.Sleep(DIRECT_SPACING)
 		}
 		finishedSending <- true
 	}()
 
-	<-finishedBroadcasting
+	//<-finishedBroadcasting
 	<-finishedSending
 
 	time.Sleep(10 * time.Second)
@@ -154,15 +171,15 @@ func runTest(t *testing.T, seq int) {
 	wg.Done()
 }
 
-func dialWaddell(t *testing.T) *ftcp.Conn {
-	conn, err := ftcp.Dial(WADDELL_ADDR)
+func dialWaddell(t *testing.T) *framed.Framed {
+	conn, err := net.Dial("tcp", WADDELL_ADDR)
 	if err != nil {
 		t.Fatalf("Unable to dial waddell")
 	}
-	return conn
+	return framed.NewFramed(conn)
 }
 
-func reconnect(t *testing.T, conn *ftcp.Conn) *ftcp.Conn {
+func reconnect(t *testing.T, conn *framed.Framed) *framed.Framed {
 	conn.Close()
 	return dialWaddell(t)
 }

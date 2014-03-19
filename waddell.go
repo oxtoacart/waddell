@@ -72,13 +72,21 @@ func main() {
 			go func() {
 				framed := framed.NewFramed(conn)
 				defer framed.Close()
-				if initialFrame, err := framed.ReadInitial(); err != nil {
+				if frame, err := framed.ReadInitial(); err != nil {
 					log.Printf("Unable to start reading: %s", err)
 				} else {
-					if msg, err := newMessage(initialFrame); err != nil {
-						log.Printf("Unable to parse initial message: %s", err)
-					} else {
-						messagesIn <- &MessageWithConn{msg: msg, conn: framed}
+					for {
+						if msg, err := newMessage(frame); err != nil {
+							log.Printf("Unable to parse initial message: %s", err)
+						} else {
+							messagesIn <- &MessageWithConn{msg: msg, conn: framed}
+						}
+						frame, err = frame.Next()
+						if err == io.EOF {
+							return
+						} else if err != nil {
+							log.Printf("Unable to read next message: %s", err)
+						}
 					}
 				}
 			}()
@@ -123,6 +131,8 @@ func dispatch() {
 				to.msgTo <- out
 			} else {
 				log.Printf("Tried to send to disconnected recipient: %s", to.addr)
+				// Discard the frame to make sure that reading can continue
+				out.frame.Discard()
 			}
 		}
 	}
@@ -195,7 +205,17 @@ func newMessage(frame *framed.Frame) (msg *Message, err error) {
 }
 
 func (msg *Message) streamTo(out *framed.Framed) error {
-	out.WriteHeader(FRAMED_HEADER_LENGTH, msg.frame.BodyLength())
+	if err := msg.writeHeaderTo(out, msg.frame.BodyLength()); err != nil {
+		return err
+	}
+
+	// Write body
+	_, err := io.Copy(out, msg.frame.Body())
+	return err
+}
+
+func (msg *Message) writeHeaderTo(out *framed.Framed, bodyLength uint16) error {
+	out.WriteHeader(FRAMED_HEADER_LENGTH, bodyLength)
 
 	// Write from, to and op to frame
 	if err := binary.Write(out, endianness, &msg.from); err != nil {
@@ -204,13 +224,7 @@ func (msg *Message) streamTo(out *framed.Framed) error {
 	if err := binary.Write(out, endianness, &msg.to); err != nil {
 		return err
 	}
-	if err := binary.Write(out, endianness, &msg.op); err != nil {
-		return err
-	}
-
-	// Write body
-	_, err := io.Copy(out, msg.frame.Body())
-	return err
+	return binary.Write(out, endianness, &msg.op)
 }
 
 func (msg *Message) withTo(to Addr) *Message {
