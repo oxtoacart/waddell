@@ -30,8 +30,10 @@ type Client struct {
 	subscriptionRequests  map[Addr]bool // requests to subscribe to Client's messages
 	subscriptionApprovals map[Addr]bool // permission to subscribe to Client's messages
 	subscriptions         map[Addr]bool
+	peers                 map[Addr]*Client
 	msgFrom               chan *Message
 	msgTo                 chan *Message
+	peerConnected         chan *Client
 }
 
 type Message struct {
@@ -105,8 +107,10 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
+					peers:                 make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
+					peerConnected:         make(chan *Client, 100),
 				}
 				go from.dispatch()
 				clients[in.msg.from] = from
@@ -121,14 +125,17 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
+					peers:                 make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
+					peerConnected:         make(chan *Client, 100),
 				}
 				go to.dispatch()
 				clients[out.to] = to
 			}
 			if to.conn != nil {
 				to.msgTo <- out
+				clients[out.from].peerConnected <- to
 			} else {
 				log.Printf("Tried to send to disconnected recipient: %s", to.addr)
 				// Discard the frame to make sure that reading can continue
@@ -148,10 +155,15 @@ func (client *Client) dispatch() {
 				if client.subscriptionRequests[out.to] {
 					client.subscriptions[out.to] = true
 				}
-			case OP_SUBSCRIBE:
-				messagesOut <- out
-			case OP_SEND:
-				messagesOut <- out
+			case OP_SUBSCRIBE, OP_SEND:
+				to := client.peers[out.to]
+				if to != nil {
+					// Send directly to peer
+					to.msgTo <- out
+				} else {
+					// Send to main dispatcher
+					messagesOut <- out
+				}
 			case OP_PUBLISH:
 				// TODO: handle publishing
 				// for to, _ := range client.subscriptions {
@@ -183,6 +195,8 @@ func (client *Client) dispatch() {
 					log.Printf("%s is not approved to send to %s", in.from, in.to)
 				}
 			}
+		case peer := <-client.peerConnected:
+			client.peers[peer.addr] = peer
 		}
 	}
 }
