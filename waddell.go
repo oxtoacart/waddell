@@ -106,7 +106,7 @@ func dispatch() {
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 1),
-					msgTo:                 make(chan *Message, 1),
+					msgTo:                 make(chan *Message, 100),
 				}
 				go from.dispatch()
 				clients[in.msg.from] = from
@@ -122,7 +122,7 @@ func dispatch() {
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
 					msgFrom:               make(chan *Message, 1),
-					msgTo:                 make(chan *Message, 1),
+					msgTo:                 make(chan *Message, 100),
 				}
 				go to.dispatch()
 				clients[out.to] = to
