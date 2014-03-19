@@ -66,7 +66,7 @@ func TestClient(t *testing.T) {
 func runTest(t *testing.T, seq int) {
 	addr := Addr(seq)
 	peers := make([]Addr, PEERS_PER_CLIENT)
-	for i := 0; i < PEERS_PER_CLIENT; i++ {
+	for i := 1; i < PEERS_PER_CLIENT; i++ {
 		peer := seq - i
 		if peer < 0 {
 			peer += NUM_CLIENTS
