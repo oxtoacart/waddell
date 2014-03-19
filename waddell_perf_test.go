@@ -11,12 +11,12 @@ import (
 )
 
 const (
-	NUM_CLIENTS         = 10000
+	NUM_CLIENTS         = 2000
 	PEERS_PER_CLIENT    = 5
-	NUM_BROADCASTS      = 25
-	BROADCAST_SPACING   = 800 * time.Millisecond
+	NUM_BROADCASTS      = 250
+	BROADCAST_SPACING   = 8 * time.Millisecond
 	NUM_DIRECT_MESSAGES = 250
-	DIRECT_SPACING      = 800 * time.Millisecond
+	DIRECT_SPACING      = 8 * time.Millisecond
 	STARTUP_SPACING     = 20 * time.Millisecond
 )
 
@@ -31,7 +31,7 @@ var (
 )
 
 func TestClient(t *testing.T) {
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(1)
 	wg.Add(NUM_CLIENTS)
 	subscribeWg.Add(NUM_CLIENTS)
 	approveWg.Add(NUM_CLIENTS)
@@ -104,7 +104,7 @@ func runTest(t *testing.T, seq int) {
 
 	time.Sleep(2 * time.Second)
 
-	data := []byte("Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello strange signaling world ")
+	data := []byte("Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello str")
 	msg := &Message{
 		sender:    addr,
 		recipient: "",
