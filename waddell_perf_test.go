@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"github.com/oxtoacart/framed"
-	"io"
 	"log"
 	"net"
 	"runtime"
@@ -13,13 +12,13 @@ import (
 )
 
 const (
-	NUM_CLIENTS         = 20
+	NUM_CLIENTS         = 1000
 	PEERS_PER_CLIENT    = 5
 	NUM_BROADCASTS      = 250
 	BROADCAST_SPACING   = 8 * time.Millisecond
-	NUM_DIRECT_MESSAGES = 2500
-	DIRECT_SPACING      = 20 * time.Microsecond
-	STARTUP_SPACING     = 20 * time.Millisecond
+	NUM_DIRECT_MESSAGES = 250
+	DIRECT_SPACING      = 75 * time.Millisecond
+	STARTUP_SPACING     = 1 * time.Millisecond
 )
 
 var (
@@ -129,9 +128,6 @@ func runTest(t *testing.T, seq int) {
 			msgReceived <- 1
 			frame, err = frame.Next()
 			if err != nil {
-				if err != io.EOF {
-					t.Errorf("Unable to read next frame: %s", err)
-				}
 				return
 			}
 		}
@@ -175,6 +171,13 @@ func dialWaddell(t *testing.T) *framed.Framed {
 	conn, err := net.Dial("tcp", WADDELL_ADDR)
 	if err != nil {
 		t.Fatalf("Unable to dial waddell")
+	}
+	tcpConn := conn.(*net.TCPConn)
+	if err := tcpConn.SetWriteBuffer(WRITE_BUFFER_BYTES); err != nil {
+		log.Printf("Unable to set write buffer, sticking with default")
+	}
+	if err := tcpConn.SetReadBuffer(READ_BUFFER_BYTES); err != nil {
+		log.Printf("Unable to set read buffer, sticking with default")
 	}
 	return framed.NewFramed(conn)
 }

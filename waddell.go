@@ -19,6 +19,9 @@ const (
 	OP_PUBLISH           = Op(4)
 	WADDELL_ADDR         = "127.0.0.1:10080"
 	FRAMED_HEADER_LENGTH = 18
+
+	WRITE_BUFFER_BYTES = 8096
+	READ_BUFFER_BYTES  = 8096
 )
 
 var endianness = binary.LittleEndian
@@ -55,7 +58,7 @@ var (
 )
 
 func main() {
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(1)
 	listener, err := net.Listen("tcp", WADDELL_ADDR)
 	if err != nil {
 		log.Fatalf("Unable to listen: %s", err)
@@ -71,6 +74,13 @@ func main() {
 		if err != nil {
 			log.Printf("Unable to accept: %s", err)
 		} else {
+			tcpConn := conn.(*net.TCPConn)
+			if err := tcpConn.SetWriteBuffer(WRITE_BUFFER_BYTES); err != nil {
+				log.Printf("Unable to set write buffer, sticking with default")
+			}
+			if err := tcpConn.SetReadBuffer(READ_BUFFER_BYTES); err != nil {
+				log.Printf("Unable to set read buffer, sticking with default")
+			}
 			go func() {
 				framed := framed.NewFramed(conn)
 				defer framed.Close()
