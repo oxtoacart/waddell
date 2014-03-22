@@ -2,13 +2,15 @@ package main
 
 import (
 	"encoding/binary"
-	"github.com/oxtoacart/bpool"
+	"fmt"
 	"github.com/oxtoacart/framed"
 	"io"
 	"log"
 	"net"
 	"os"
 	"runtime"
+	"runtime/pprof"
+	"time"
 )
 
 type Addr uint64
@@ -27,13 +29,13 @@ const (
 
 var (
 	endianness = binary.LittleEndian
-	bufferPool = bpool.NewBytePool(1000000, 200)
+	mpool      = NewMessagePool(100000, 1024) // Size this based on the transaction rate
 )
 
 // Client represents a client of waddell's
 type Client struct {
 	addr                  Addr
-	conn                  *framed.Framed
+	conn                  io.ReadWriteCloser
 	subscriptionRequests  map[Addr]bool // requests to subscribe to Client's messages
 	subscriptionApprovals map[Addr]bool // permission to subscribe to Client's messages
 	subscriptions         map[Addr]bool
@@ -41,22 +43,11 @@ type Client struct {
 	msgTo                 chan *Message
 }
 
-type Message struct {
-	from  Addr
-	to    Addr
-	op    Op
-	frame *framed.Frame
-}
-
-type MessageWithConn struct {
-	msg  *Message
-	conn *framed.Framed
-}
-
 var (
-	clients     = make(map[Addr]*Client)
-	messagesIn  = make(chan *MessageWithConn, 10000)
-	messagesOut = make(chan *Message, 10000)
+	clients       = make(map[Addr]*Client)
+	messagesIn    = make(chan *Message, 100000) // size this based on the max expected message rate
+	messagesOut   = make(chan *Message, 100000) // size this based on the max expected message rate
+	profileTicker = time.NewTicker(30 * time.Second)
 )
 
 func HeaderFor(from Addr, to Addr, op Op) []byte {
@@ -77,6 +68,8 @@ func main() {
 
 	go dispatch()
 
+	go profile()
+
 	log.Printf("Listening at %s", getAddr())
 	// Accept connections, read message and respond
 	for {
@@ -92,16 +85,19 @@ func main() {
 				log.Printf("Unable to set read buffer, sticking with default")
 			}
 			go func() {
-				framed := framed.NewFramed(conn, bufferPool)
-				defer conn.Close()
+				framed := &framed.Framed{conn}
+				defer framed.Close()
 				for {
-					frame, err := framed.ReadFrame()
-					if err == io.EOF {
+					msg := mpool.Get()
+					if err := msg.ReadFrom(framed); err != nil {
+						// TODO: log error to debug log
+						if err != io.EOF {
+							log.Printf("Unable to read next message: %s", err)
+						}
+						msg.Release()
 						return
-					} else if err != nil {
-						log.Printf("Unable to read next message: %s", err)
 					} else {
-						messagesIn <- &MessageWithConn{msg: newMessage(frame), conn: framed}
+						messagesIn <- msg
 					}
 				}
 			}()
@@ -113,21 +109,21 @@ func dispatch() {
 	for {
 		select {
 		case in := <-messagesIn:
-			from := clients[in.msg.from]
+			from := clients[in.from]
 			if from == nil {
 				from = &Client{
-					addr:                  in.msg.from,
+					addr:                  in.from,
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					msgFrom:               make(chan *Message, 1),
+					msgFrom:               make(chan *Message, 10),
 					msgTo:                 make(chan *Message, 100),
 				}
 				go from.dispatch()
-				clients[in.msg.from] = from
+				clients[in.from] = from
 			}
 			from.conn = in.conn
-			from.msgFrom <- in.msg
+			from.msgFrom <- in
 		case out := <-messagesOut:
 			to := clients[out.to]
 			if to == nil {
@@ -136,7 +132,7 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					msgFrom:               make(chan *Message, 1),
+					msgFrom:               make(chan *Message, 10),
 					msgTo:                 make(chan *Message, 100),
 				}
 				go to.dispatch()
@@ -151,67 +147,73 @@ func (client *Client) dispatch() {
 	for {
 		select {
 		case out := <-client.msgFrom:
-			switch out.op {
-			case OP_APPROVE:
-				defer out.frame.Release()
-				client.subscriptionApprovals[out.to] = true
-				if client.subscriptionRequests[out.to] {
-					client.subscriptions[out.to] = true
-				}
-			case OP_SUBSCRIBE, OP_SEND:
-				messagesOut <- out
-			case OP_PUBLISH:
-				// TODO: handle publishing
-				// for to, _ := range client.subscriptions {
-				// 	messagesOut <- out.withTo(to)
-				// }
-			}
+			client.handleOutbound(out)
 		case in := <-client.msgTo:
-			defer in.frame.Release()
-			switch in.op {
-			case OP_APPROVE:
-				log.Printf("Got request to approve subscription from a different user - this shouldn't happen")
-			case OP_SUBSCRIBE:
-				client.subscriptionRequests[in.from] = true
-				if client.subscriptionApprovals[in.from] {
-					// Complete subscription
-					client.subscriptions[in.from] = true
-				}
-			case OP_SEND:
-				if client.conn != nil { // TODO: make sure from is actually approved
-					if err := client.conn.WriteFrame(in.frame.Buffers...); err != nil {
-						if err == io.EOF {
-							client.conn = nil
-						} else {
-							log.Printf("Unable to send message from %s to %s: %s", in.from, in.to, err)
-						}
-					}
-				} else if client.conn == nil {
-					log.Printf("Client %s has no connection", client.addr)
-				} else {
-					log.Printf("%s is not approved to send to %s", in.from, in.to)
-				}
-			}
+			client.handleInbound(in)
 		}
 	}
 }
 
-func newMessage(frame *framed.Frame) *Message {
-	buffer := frame.Buffers[0]
-	return &Message{
-		frame: frame,
-		from:  Addr(endianness.Uint64(buffer[0:8])),
-		to:    Addr(endianness.Uint64(buffer[8:16])),
-		op:    Op(endianness.Uint16(buffer[16:18])),
+func (client *Client) handleOutbound(out *Message) {
+	switch out.op {
+	case OP_APPROVE:
+		defer out.Release()
+		client.subscriptionApprovals[out.to] = true
+		if client.subscriptionRequests[out.to] {
+			client.subscriptions[out.to] = true
+		}
+	case OP_SUBSCRIBE, OP_SEND:
+		messagesOut <- out
+	case OP_PUBLISH:
+		// TODO: handle publishing
+		// for to, _ := range client.subscriptions {
+		// 	messagesOut <- out.withTo(to)
+		// }
 	}
 }
 
-func (msg *Message) withTo(to Addr) *Message {
-	return &Message{
-		from:  msg.from,
-		to:    to,
-		op:    OP_SEND,
-		frame: msg.frame,
+func (client *Client) handleInbound(in *Message) {
+	defer in.Release()
+	switch in.op {
+	case OP_APPROVE:
+		log.Printf("Got request to approve subscription from a different user - this shouldn't happen")
+	case OP_SUBSCRIBE:
+		client.subscriptionRequests[in.from] = true
+		if client.subscriptionApprovals[in.from] {
+			// Complete subscription
+			client.subscriptions[in.from] = true
+		}
+	case OP_SEND:
+		if client.subscriptions[in.from] {
+			if client.conn != nil { // TODO: make sure from is actually approved
+				if err := in.WriteTo(client.conn); err != nil {
+					if err == io.EOF {
+						client.conn = nil
+					} else {
+						log.Printf("Unable to send message from %s to %s: %s", in.from, in.to, err)
+					}
+				}
+			} else if client.conn == nil {
+				log.Printf("Client %s has no connection", client.addr)
+			}
+		} else {
+			log.Printf("%s is not approved to send to %s", in.from, in.to)
+		}
+	}
+}
+
+// profile periodically dumps a heap profile in /tmp/waddell_heap_<timestamp>.mprof
+func profile() {
+	for {
+		select {
+		case <-profileTicker.C:
+			runtime.GC()
+			f, err := os.Create(fmt.Sprintf("/tmp/waddell_heap_%d.mprof", time.Now().Unix()))
+			if err != nil {
+				log.Printf("Unable to write heap profile: %s", err)
+			}
+			pprof.WriteHeapProfile(f)
+		}
 	}
 }
 
