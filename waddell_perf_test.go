@@ -26,7 +26,7 @@ var (
 	STARTUP_SPACING  = time.Duration(intOrDefault("STARTUP_SPACING", 1000)) * time.Microsecond
 
 	startReadingAt = time.Now().Add(time.Duration(NUM_CLIENTS) * STARTUP_SPACING * 2)
-	stopReadingAt  = startReadingAt.Add(10 * time.Second)
+	stopReadingAt  = startReadingAt.Add(60 * time.Second)
 )
 
 func intOrDefault(name string, d int) int {
@@ -38,7 +38,7 @@ func intOrDefault(name string, d int) int {
 }
 
 func TestClient(t *testing.T) {
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	wg.Add(NUM_CLIENTS * 2) // *2 to accomodate read + write goroutines
 
 	go func() {
@@ -144,7 +144,7 @@ func runTest(t *testing.T, seq int) {
 }
 
 func dialWaddell(t *testing.T) (net.Conn, *framed.Framed) {
-	conn, err := net.Dial("tcp", WADDELL_ADDR)
+	conn, err := net.Dial("tcp", getAddr())
 	if err != nil {
 		t.Fatalf("Unable to dial waddell")
 	}

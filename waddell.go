@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"runtime"
 )
 
@@ -18,7 +19,6 @@ const (
 	OP_APPROVE           = Op(2)
 	OP_SEND              = Op(3)
 	OP_PUBLISH           = Op(4)
-	WADDELL_ADDR         = "127.0.0.1:10080"
 	FRAMED_HEADER_LENGTH = 18
 
 	WRITE_BUFFER_BYTES = 8096
@@ -68,8 +68,8 @@ func HeaderFor(from Addr, to Addr, op Op) []byte {
 }
 
 func main() {
-	runtime.GOMAXPROCS(1)
-	listener, err := net.Listen("tcp", WADDELL_ADDR)
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	listener, err := net.Listen("tcp", getAddr())
 	if err != nil {
 		log.Fatalf("Unable to listen: %s", err)
 	}
@@ -77,7 +77,7 @@ func main() {
 
 	go dispatch()
 
-	log.Printf("Listening at %s", WADDELL_ADDR)
+	log.Printf("Listening at %s", getAddr())
 	// Accept connections, read message and respond
 	for {
 		conn, err := listener.Accept()
@@ -213,4 +213,12 @@ func (msg *Message) withTo(to Addr) *Message {
 		op:    OP_SEND,
 		frame: msg.frame,
 	}
+}
+
+func getAddr() string {
+	addr := os.Getenv("ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:10080"
+	}
+	return addr
 }
