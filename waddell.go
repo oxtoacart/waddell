@@ -33,10 +33,8 @@ type Client struct {
 	subscriptionRequests  map[Addr]bool // requests to subscribe to Client's messages
 	subscriptionApprovals map[Addr]bool // permission to subscribe to Client's messages
 	subscriptions         map[Addr]bool
-	peers                 map[Addr]*Client
 	msgFrom               chan *Message
 	msgTo                 chan *Message
-	peerConnected         chan *Client
 }
 
 type Message struct {
@@ -81,6 +79,9 @@ func main() {
 			if err := tcpConn.SetReadBuffer(READ_BUFFER_BYTES); err != nil {
 				log.Printf("Unable to set read buffer, sticking with default")
 			}
+			if err := tcpConn.SetNoDelay(false); err != nil {
+				log.Printf("Unable to enable Nagle's algorithm, leaving off")
+			}
 			go func() {
 				framed := framed.NewFramed(conn)
 				defer framed.Close()
@@ -89,15 +90,20 @@ func main() {
 				} else {
 					for {
 						if msg, err := newMessage(frame); err != nil {
-							log.Printf("Unable to parse initial message: %s", err)
+							log.Printf("Unable to parse message: %s", err)
 						} else {
 							messagesIn <- &MessageWithConn{msg: msg, conn: framed}
 						}
 						frame, err = frame.Next()
-						if err == io.EOF {
-							return
-						} else if err != nil {
-							log.Printf("Unable to read next message: %s", err)
+						if err != nil {
+							if err == io.EOF {
+								if frame == nil {
+									// Only pay attention to EOF if we didn't get a frame
+									return
+								}
+							} else {
+								log.Printf("Unable to read next message: %s", err)
+							}
 						}
 					}
 				}
@@ -117,10 +123,8 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					peers:                 make(map[Addr]*Client),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
-					peerConnected:         make(chan *Client, 100),
 				}
 				go from.dispatch()
 				clients[in.msg.from] = from
@@ -135,22 +139,13 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					peers:                 make(map[Addr]*Client),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
-					peerConnected:         make(chan *Client, 100),
 				}
 				go to.dispatch()
 				clients[out.to] = to
 			}
-			if to.conn != nil {
-				to.msgTo <- out
-				clients[out.from].peerConnected <- to
-			} else {
-				log.Printf("Tried to send to disconnected recipient: %s", to.addr)
-				// Discard the frame to make sure that reading can continue
-				out.frame.Discard()
-			}
+			to.msgTo <- out
 		}
 	}
 }
@@ -166,14 +161,8 @@ func (client *Client) dispatch() {
 					client.subscriptions[out.to] = true
 				}
 			case OP_SUBSCRIBE, OP_SEND:
-				to := client.peers[out.to]
-				if to != nil {
-					// Send directly to peer
-					to.msgTo <- out
-				} else {
-					// Send to main dispatcher
-					messagesOut <- out
-				}
+				// Send to main dispatcher
+				messagesOut <- out
 			case OP_PUBLISH:
 				// TODO: handle publishing
 				// for to, _ := range client.subscriptions {
@@ -199,14 +188,16 @@ func (client *Client) dispatch() {
 							log.Printf("Unable to send message from %s to %s: %s", in.from, in.to, err)
 						}
 					}
-				} else if client.conn == nil {
-					log.Printf("Client %s has no connection", client.addr)
 				} else {
-					log.Printf("%s is not approved to send to %s", in.from, in.to)
+					// Discard message
+					in.frame.Discard()
+					if client.conn == nil {
+						log.Printf("Client %s has no connection", client.addr)
+					} else {
+						log.Printf("%s is not approved to send to %s", in.from, in.to)
+					}
 				}
 			}
-		case peer := <-client.peerConnected:
-			client.peers[peer.addr] = peer
 		}
 	}
 }
@@ -234,8 +225,7 @@ func (msg *Message) streamTo(out *framed.Framed) error {
 	}
 
 	// Write body
-	_, err := io.Copy(out, msg.frame.Body())
-	return err
+	return out.StreamBody(msg.frame.BodyLength(), msg.frame.Body())
 }
 
 func (msg *Message) writeHeaderTo(out *framed.Framed, bodyLength uint16) error {

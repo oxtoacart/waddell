@@ -5,37 +5,41 @@ import (
 	"github.com/oxtoacart/framed"
 	"log"
 	"net"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
 
-const (
-	NUM_CLIENTS         = 1000
-	PEERS_PER_CLIENT    = 5
-	NUM_BROADCASTS      = 250
-	BROADCAST_SPACING   = 8 * time.Millisecond
-	NUM_DIRECT_MESSAGES = 250
-	DIRECT_SPACING      = 75 * time.Millisecond
-	STARTUP_SPACING     = 1 * time.Millisecond
-)
-
 var (
 	wg                   = sync.WaitGroup{}
-	subscribeWg          = sync.WaitGroup{}
-	approveWg            = sync.WaitGroup{}
 	msgReceived          = make(chan int, 100)
 	msgCount             = 0
 	firstMessageReceived time.Time
 	lastMessageReceived  time.Time
+
+	NUM_CLIENTS      = intOrDefault("NUM_CLIENTS", 20)
+	PEERS_PER_CLIENT = intOrDefault("PEERS_PER_CLIENT", 5)
+	DIRECT_SPACING   = time.Duration(intOrDefault("DIRECT_SPACING", 50000)) * time.Microsecond
+	STARTUP_SPACING  = time.Duration(intOrDefault("STARTUP_SPACING", 1000)) * time.Microsecond
+
+	startReadingAt = time.Now().Add(time.Duration(NUM_CLIENTS) * STARTUP_SPACING * 2)
+	stopReadingAt  = startReadingAt.Add(10 * time.Second)
 )
 
+func intOrDefault(name string, d int) int {
+	val, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || val == 0 {
+		val = d
+	}
+	return val
+}
+
 func TestClient(t *testing.T) {
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(2)
 	wg.Add(NUM_CLIENTS)
-	subscribeWg.Add(NUM_CLIENTS)
-	approveWg.Add(NUM_CLIENTS)
 
 	go func() {
 		for {
@@ -60,13 +64,14 @@ func TestClient(t *testing.T) {
 
 	delta := lastMessageReceived.Sub(firstMessageReceived).Seconds()
 	log.Printf("Received %d messages at %d mps", msgCount, float64(msgCount)/delta)
+	os.Exit(0)
 }
 
 func runTest(t *testing.T, seq int) {
 	addr := Addr(seq)
 	peers := make([]Addr, PEERS_PER_CLIENT)
-	for i := 1; i < PEERS_PER_CLIENT; i++ {
-		peer := seq - i
+	for i := 0; i < PEERS_PER_CLIENT; i++ {
+		peer := seq - i - 1
 		if peer < 0 {
 			peer += NUM_CLIENTS
 		}
@@ -74,36 +79,24 @@ func runTest(t *testing.T, seq int) {
 	}
 
 	conn := dialWaddell(t)
-	defer conn.Close()
 
-	for _, peer := range peers {
-		msg := &Message{
-			from: addr,
-			to:   peer,
-			op:   OP_SUBSCRIBE,
-		}
-		if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
-			t.Errorf("Unable to subscribe: %s", err)
-		}
-	}
-	subscribeWg.Done()
+	go func() {
+		for _, peer := range peers {
+			msg := &Message{
+				from: addr,
+				to:   peer,
+				op:   OP_SUBSCRIBE,
+			}
+			if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
+				t.Errorf("Unable to subscribe: %s", err)
+			}
 
-	for _, peer := range peers {
-		msg := &Message{
-			from: addr,
-			to:   peer,
-			op:   OP_APPROVE,
+			msg.op = OP_APPROVE
+			if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
+				t.Errorf("Unable to approve subscription: %s", err)
+			}
 		}
-		if err := msg.writeHeaderTo(conn, uint16(0)); err != nil {
-			t.Errorf("Unable to approve subscription: %s", err)
-		}
-	}
-	approveWg.Done()
-
-	subscribeWg.Wait()
-	approveWg.Wait()
-
-	time.Sleep(2 * time.Second)
+	}()
 
 	body := []byte("Hello strange signaling world Hello strange signaling world Hello strange signaling world Hello str")
 	bodyLength := uint16(len(body))
@@ -113,22 +106,28 @@ func runTest(t *testing.T, seq int) {
 		op:   OP_PUBLISH,
 	}
 
-	//finishedBroadcasting := make(chan bool)
-	finishedSending := make(chan bool)
+	time.Sleep(startReadingAt.Sub(time.Now()))
 
 	go func() {
+		defer wg.Done()
+
 		frame, err := conn.ReadInitial()
 		if err != nil {
 			t.Errorf("Unable to read initial frame: %s", err)
-			return
 		}
 		for {
-			// Discard the frame
-			frame.Discard()
-			msgReceived <- 1
-			frame, err = frame.Next()
-			if err != nil {
+			continueFor := stopReadingAt.Sub(time.Now())
+			select {
+			case <-time.After(continueFor):
 				return
+			default:
+				// Discard the frame
+				frame.Discard()
+				msgReceived <- 1
+				frame, err = frame.Next()
+				if err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -144,27 +143,30 @@ func runTest(t *testing.T, seq int) {
 	// }()
 
 	go func() {
-		for i := 0; i < NUM_DIRECT_MESSAGES; i++ {
-			msgTo := msg.withTo(peers[i%PEERS_PER_CLIENT])
-			if err := msgTo.writeHeaderTo(conn, bodyLength); err != nil {
-				t.Errorf("Unable to send message: %s", err)
-				break
+		defer conn.Close()
+		defer wg.Done()
+
+		i := 0
+		for {
+			continueFor := stopReadingAt.Sub(time.Now())
+			select {
+			case <-time.After(continueFor):
+				return
+			default:
+				msgTo := msg.withTo(peers[i%PEERS_PER_CLIENT])
+				i++
+				if err := msgTo.writeHeaderTo(conn, bodyLength); err != nil {
+					t.Errorf("Unable to send message: %s", err)
+					break
+				}
+				if _, err := conn.Write(body); err != nil {
+					t.Errorf("Unable to write message body: %s", err)
+					break
+				}
+				time.Sleep(DIRECT_SPACING)
 			}
-			if _, err := conn.Write(body); err != nil {
-				t.Errorf("Unable to write message body: %s", err)
-				break
-			}
-			time.Sleep(DIRECT_SPACING)
 		}
-		finishedSending <- true
 	}()
-
-	//<-finishedBroadcasting
-	<-finishedSending
-
-	time.Sleep(10 * time.Second)
-
-	wg.Done()
 }
 
 func dialWaddell(t *testing.T) *framed.Framed {
@@ -178,6 +180,9 @@ func dialWaddell(t *testing.T) *framed.Framed {
 	}
 	if err := tcpConn.SetReadBuffer(READ_BUFFER_BYTES); err != nil {
 		log.Printf("Unable to set read buffer, sticking with default")
+	}
+	if err := tcpConn.SetNoDelay(false); err != nil {
+		log.Printf("Unable to enable Nagle's algorithm, leaving off")
 	}
 	return framed.NewFramed(conn)
 }
