@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"github.com/oxtoacart/bpool"
 	"github.com/oxtoacart/framed"
 	"io"
 	"log"
@@ -24,7 +25,10 @@ const (
 	READ_BUFFER_BYTES  = 8096
 )
 
-var endianness = binary.LittleEndian
+var (
+	endianness = binary.LittleEndian
+	bufferPool = bpool.NewBytePool(1000000, 200)
+)
 
 // Client represents a client of waddell's
 type Client struct {
@@ -33,10 +37,8 @@ type Client struct {
 	subscriptionRequests  map[Addr]bool // requests to subscribe to Client's messages
 	subscriptionApprovals map[Addr]bool // permission to subscribe to Client's messages
 	subscriptions         map[Addr]bool
-	peers                 map[Addr]*Client
 	msgFrom               chan *Message
 	msgTo                 chan *Message
-	peerConnected         chan *Client
 }
 
 type Message struct {
@@ -53,9 +55,17 @@ type MessageWithConn struct {
 
 var (
 	clients     = make(map[Addr]*Client)
-	messagesIn  = make(chan *MessageWithConn, 100000)
-	messagesOut = make(chan *Message, 100000)
+	messagesIn  = make(chan *MessageWithConn, 10000)
+	messagesOut = make(chan *Message, 10000)
 )
+
+func HeaderFor(from Addr, to Addr, op Op) []byte {
+	header := make([]byte, 18)
+	endianness.PutUint64(header, uint64(from))
+	endianness.PutUint64(header[8:16], uint64(to))
+	endianness.PutUint16(header[16:18], uint16(op))
+	return header
+}
 
 func main() {
 	runtime.GOMAXPROCS(1)
@@ -82,23 +92,16 @@ func main() {
 				log.Printf("Unable to set read buffer, sticking with default")
 			}
 			go func() {
-				framed := framed.NewFramed(conn)
-				defer framed.Close()
-				if frame, err := framed.ReadInitial(); err != nil {
-					log.Printf("Unable to start reading: %s", err)
-				} else {
-					for {
-						if msg, err := newMessage(frame); err != nil {
-							log.Printf("Unable to parse initial message: %s", err)
-						} else {
-							messagesIn <- &MessageWithConn{msg: msg, conn: framed}
-						}
-						frame, err = frame.Next()
-						if err == io.EOF {
-							return
-						} else if err != nil {
-							log.Printf("Unable to read next message: %s", err)
-						}
+				framed := framed.NewFramed(conn, bufferPool)
+				defer conn.Close()
+				for {
+					frame, err := framed.ReadFrame()
+					if err == io.EOF {
+						return
+					} else if err != nil {
+						log.Printf("Unable to read next message: %s", err)
+					} else {
+						messagesIn <- &MessageWithConn{msg: newMessage(frame), conn: framed}
 					}
 				}
 			}()
@@ -117,10 +120,8 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					peers:                 make(map[Addr]*Client),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
-					peerConnected:         make(chan *Client, 100),
 				}
 				go from.dispatch()
 				clients[in.msg.from] = from
@@ -135,22 +136,13 @@ func dispatch() {
 					subscriptionRequests:  make(map[Addr]bool),
 					subscriptionApprovals: make(map[Addr]bool),
 					subscriptions:         make(map[Addr]bool),
-					peers:                 make(map[Addr]*Client),
 					msgFrom:               make(chan *Message, 1),
 					msgTo:                 make(chan *Message, 100),
-					peerConnected:         make(chan *Client, 100),
 				}
 				go to.dispatch()
 				clients[out.to] = to
 			}
-			if to.conn != nil {
-				to.msgTo <- out
-				clients[out.from].peerConnected <- to
-			} else {
-				log.Printf("Tried to send to disconnected recipient: %s", to.addr)
-				// Discard the frame to make sure that reading can continue
-				out.frame.Discard()
-			}
+			to.msgTo <- out
 		}
 	}
 }
@@ -161,19 +153,13 @@ func (client *Client) dispatch() {
 		case out := <-client.msgFrom:
 			switch out.op {
 			case OP_APPROVE:
+				defer out.frame.Release()
 				client.subscriptionApprovals[out.to] = true
 				if client.subscriptionRequests[out.to] {
 					client.subscriptions[out.to] = true
 				}
 			case OP_SUBSCRIBE, OP_SEND:
-				to := client.peers[out.to]
-				if to != nil {
-					// Send directly to peer
-					to.msgTo <- out
-				} else {
-					// Send to main dispatcher
-					messagesOut <- out
-				}
+				messagesOut <- out
 			case OP_PUBLISH:
 				// TODO: handle publishing
 				// for to, _ := range client.subscriptions {
@@ -181,6 +167,7 @@ func (client *Client) dispatch() {
 				// }
 			}
 		case in := <-client.msgTo:
+			defer in.frame.Release()
 			switch in.op {
 			case OP_APPROVE:
 				log.Printf("Got request to approve subscription from a different user - this shouldn't happen")
@@ -192,7 +179,7 @@ func (client *Client) dispatch() {
 				}
 			case OP_SEND:
 				if client.conn != nil { // TODO: make sure from is actually approved
-					if err := in.streamTo(client.conn); err != nil {
+					if err := client.conn.WriteFrame(in.frame.Buffers...); err != nil {
 						if err == io.EOF {
 							client.conn = nil
 						} else {
@@ -205,56 +192,25 @@ func (client *Client) dispatch() {
 					log.Printf("%s is not approved to send to %s", in.from, in.to)
 				}
 			}
-		case peer := <-client.peerConnected:
-			client.peers[peer.addr] = peer
 		}
 	}
 }
 
-func newMessage(frame *framed.Frame) (msg *Message, err error) {
-	// TODO: use buffer pool for this
-	msg = &Message{frame: frame}
-
-	// Read from, to and op from frame header
-	header := frame.Header()
-	if err = binary.Read(header, endianness, &msg.from); err != nil {
-		return
+func newMessage(frame *framed.Frame) *Message {
+	buffer := frame.Buffers[0]
+	return &Message{
+		frame: frame,
+		from:  Addr(endianness.Uint64(buffer[0:8])),
+		to:    Addr(endianness.Uint64(buffer[8:16])),
+		op:    Op(endianness.Uint16(buffer[16:18])),
 	}
-	if err = binary.Read(header, endianness, &msg.to); err != nil {
-		return
-	}
-	err = binary.Read(header, endianness, &msg.op)
-
-	return
-}
-
-func (msg *Message) streamTo(out *framed.Framed) error {
-	if err := msg.writeHeaderTo(out, msg.frame.BodyLength()); err != nil {
-		return err
-	}
-
-	// Write body
-	_, err := io.Copy(out, msg.frame.Body())
-	return err
-}
-
-func (msg *Message) writeHeaderTo(out *framed.Framed, bodyLength uint16) error {
-	out.WriteHeader(FRAMED_HEADER_LENGTH, bodyLength)
-
-	// Write from, to and op to frame
-	if err := binary.Write(out, endianness, &msg.from); err != nil {
-		return err
-	}
-	if err := binary.Write(out, endianness, &msg.to); err != nil {
-		return err
-	}
-	return binary.Write(out, endianness, &msg.op)
 }
 
 func (msg *Message) withTo(to Addr) *Message {
 	return &Message{
-		from: msg.from,
-		to:   to,
-		op:   OP_SEND,
+		from:  msg.from,
+		to:    to,
+		op:    OP_SEND,
+		frame: msg.frame,
 	}
 }
