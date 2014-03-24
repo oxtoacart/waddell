@@ -220,7 +220,7 @@ func profile() {
 func getAddr() string {
 	addr := os.Getenv("ADDR")
 	if addr == "" {
-		addr = "127.0.0.1:10080"
+		addr = "0.0.0.0:10080"
 	}
 	return addr
 }
